@@ -39,9 +39,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         runtime::metal::MetalThreadEntry::ThreadLocal();
                     id<MTLDevice> dev = entry_ptr->metal_api->GetDevice(buf->device);
                     id<MTLBuffer> temp = rt->GetTempBuffer(buf->device, [mtlbuf length]);
-                    entry_ptr->metal_api->CopyDataFromTo(
-                        (__bridge void*)mtlbuf, 0, (__bridge void*)temp, 0, [mtlbuf length],
-                        buf -> device, buf -> device, buf -> dtype, nullptr);
+                    runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+                        entry_ptr->metal_api->GetCurrentStream(buf->device), buf->device.device_id);
+                    id<MTLCommandBuffer> cb =
+                        stream->GetCommandBuffer("tvm.contrib.mps.buffer2img.copy");
+                    id<MTLBlitCommandEncoder> encoder = [cb blitCommandEncoder];
+                    [encoder copyFromBuffer:mtlbuf
+                               sourceOffset:0
+                                   toBuffer:temp
+                          destinationOffset:0
+                                       size:[mtlbuf length]];
+                    [encoder endEncoding];
+                    [cb commit];
+                    [cb waitUntilCompleted];
 
                     MPSImageDescriptor* desc = [MPSImageDescriptor
                         imageDescriptorWithChannelFormat:MPSImageFeatureChannelFormatFloat32
@@ -76,9 +86,18 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                            dataLayout:MPSDataLayoutHeightxWidthxFeatureChannels
                            imageIndex:0];
 
-                    entry_ptr->metal_api->CopyDataFromTo(
-                        (__bridge void*)temp, 0, (__bridge void*)mtlbuf, 0, [mtlbuf length],
-                        buf -> device, buf -> device, buf -> dtype, nullptr);
+                    runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+                        entry_ptr->metal_api->GetCurrentStream(buf->device), buf->device.device_id);
+                    id<MTLCommandBuffer> cb =
+                        stream->GetCommandBuffer("tvm.contrib.mps.img2buffer.copy");
+                    id<MTLBlitCommandEncoder> encoder = [cb blitCommandEncoder];
+                    [encoder copyFromBuffer:temp
+                               sourceOffset:0
+                                   toBuffer:mtlbuf
+                          destinationOffset:0
+                                       size:[mtlbuf length]];
+                    [encoder endEncoding];
+                    [cb commit];
                   })
       .def_packed("tvm.contrib.mps.conv2d", [](ffi::PackedArgs args, ffi::Any* ret) {
         // MPS-NHWC
@@ -109,8 +128,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
         MetalThreadEntry* entry_ptr = MetalThreadEntry::ThreadLocal();
         runtime::metal::MetalThreadEntry* rt = runtime::metal::MetalThreadEntry::ThreadLocal();
         id<MTLDevice> dev = entry_ptr->metal_api->GetDevice(data->device);
-        id<MTLCommandQueue> queue = entry_ptr->metal_api->GetCommandQueue(data->device);
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+            entry_ptr->metal_api->GetCurrentStream(data->device), data->device.device_id);
+        id<MTLCommandBuffer> cb = stream->GetCommandBuffer("tvm.contrib.mps.conv2d");
         // data to MPSImage
         DLTensor tmp_in;
         (*f_buf2img)(data, &tmp_in);
@@ -118,9 +138,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
         // weight to temp memory
         id<MTLBuffer> bufB = (__bridge id<MTLBuffer>)(weight->data);
         id<MTLBuffer> tempB = rt->GetTempBuffer(weight->device, [bufB length]);
-        entry_ptr->metal_api->CopyDataFromTo((__bridge void*)bufB, 0, (__bridge void*)tempB, 0,
-                                             [bufB length], weight -> device, weight -> device,
-                                             tmp_in.dtype, nullptr);
+        {
+          id<MTLCommandBuffer> copy_cb =
+              stream->GetCommandBuffer("tvm.contrib.mps.conv2d.copy_weight");
+          id<MTLBlitCommandEncoder> encoder = [copy_cb blitCommandEncoder];
+          [encoder copyFromBuffer:bufB
+                     sourceOffset:0
+                         toBuffer:tempB
+                destinationOffset:0
+                             size:[bufB length]];
+          [encoder endEncoding];
+          [copy_cb commit];
+          [copy_cb waitUntilCompleted];
+        }
         float* ptr_w = (float*)[tempB contents];
         // output to MPSImage
         DLTensor tmp_out;
@@ -153,10 +183,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
         }
         [conv encodeToCommandBuffer:cb sourceImage:tempA destinationImage:tempC];
 
-        [cb commit];
         id<MTLBlitCommandEncoder> encoder = [cb blitCommandEncoder];
         [encoder synchronizeResource:tempC.texture];
         [encoder endEncoding];
+        [cb commit];
         [cb waitUntilCompleted];
 
         (*f_img2buf)(&tmp_out, output);

@@ -48,8 +48,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
     // ICHECK_EQ(A->device, B->device);
     // ICHECK_EQ(A->device, C->device);
     id<MTLDevice> dev = entry_ptr->metal_api->GetDevice(A->device);
-    id<MTLCommandQueue> queue = entry_ptr->metal_api->GetCommandQueue(A->device);
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+        entry_ptr->metal_api->GetCurrentStream(A->device), A->device.device_id);
+    id<MTLCommandBuffer> cb = stream->GetCommandBuffer("tvm.contrib.mps.matmul");
     NSUInteger M = A->shape[0 + (transa ? 1 : 0)];
     NSUInteger N = B->shape[1 - (transb ? 1 : 0)];
     NSUInteger K = B->shape[0 + (transb ? 1 : 0)];
