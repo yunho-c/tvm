@@ -93,3 +93,59 @@ def conv2d(data, weight, pad="SAME", stride=1):
         ),
         name="C",
     )
+
+
+def lstm(
+    input,
+    weight_ih,
+    weight_hh,
+    bias_ih,
+    bias_hh,
+    h0,
+    c0,
+    hidden_size,
+    num_layers=1,
+    batch_first=False,
+    bidirectional=False,
+):
+    """Create an extern op that runs an LSTM using MPS.
+
+    Notes
+    -----
+    Current implementation limitations:
+    - float32 only
+    - num_layers=1 only
+    - bidirectional=False only
+    - h0/c0 inputs are accepted but may be ignored by the underlying runtime implementation.
+    """
+    if batch_first:
+        batch, seq_len, _ = input.shape
+    else:
+        seq_len, batch, _ = input.shape
+
+    return te.extern(
+        [
+            (batch, seq_len, hidden_size) if batch_first else (seq_len, batch, hidden_size),
+            (1, batch, hidden_size),
+            (1, batch, hidden_size),
+        ],
+        [input, weight_ih, weight_hh, bias_ih, bias_hh, h0, c0],
+        lambda ins, outs: tvm.tir.call_packed(
+            "tvm.contrib.mps.lstm",
+            ins[0],
+            ins[1],
+            ins[2],
+            ins[3],
+            ins[4],
+            ins[5],
+            ins[6],
+            outs[0],
+            outs[1],
+            outs[2],
+            hidden_size,
+            num_layers,
+            batch_first,
+            bidirectional,
+        ),
+        name="lstm_out",
+    )
