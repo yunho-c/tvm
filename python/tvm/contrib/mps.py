@@ -149,3 +149,59 @@ def lstm(
         ),
         name="lstm_out",
     )
+
+
+def lstm_packed(
+    input,
+    lengths,
+    weight_ih,
+    weight_hh,
+    bias_ih,
+    bias_hh,
+    h0,
+    c0,
+    hidden_size,
+    num_layers=1,
+    batch_first=False,
+    bidirectional=False,
+    reverse=False,
+):
+    """Create an extern op that runs a length-aware (packed-semantics) LSTM using MPS.
+
+    This variant carries `lengths` explicitly so a backend can implement true variable-length
+    behavior (e.g. via MPS ragged-row encoding).
+    """
+    if batch_first:
+        batch, seq_len, _ = input.shape
+    else:
+        seq_len, batch, _ = input.shape
+
+    return te.extern(
+        [
+            (batch, seq_len, hidden_size) if batch_first else (seq_len, batch, hidden_size),
+            (1, batch, hidden_size),
+            (1, batch, hidden_size),
+        ],
+        [input, lengths, weight_ih, weight_hh, bias_ih, bias_hh, h0, c0],
+        lambda ins, outs: tvm.tir.call_packed(
+            "tvm.contrib.mps.lstm_packed",
+            ins[0],
+            ins[1],
+            ins[2],
+            ins[3],
+            ins[4],
+            ins[5],
+            ins[6],
+            ins[7],
+            outs[0],
+            outs[1],
+            outs[2],
+            hidden_size,
+            num_layers,
+            batch_first,
+            bidirectional,
+            reverse,
+        ),
+        dtype=["float32", "float32", "float32"],
+        name="lstm_out_packed",
+    )

@@ -201,6 +201,60 @@ std::vector<float> CopyTensorToCPUFloat32(MetalThreadEntry* entry_ptr, DLTensor*
   return out;
 }
 
+std::vector<int64_t> CopyTensorToCPUInt64(MetalThreadEntry* entry_ptr, DLTensor* t) {
+  ICHECK(TypeMatch(t->dtype, kDLInt, 64));
+  ICHECK(ffi::IsContiguous(*t));
+  ICHECK_EQ(t->device.device_type, kDLMetal);
+  ICHECK(t->data != nullptr);
+
+  size_t nbytes = ffi::GetDataSize(*t);
+  ICHECK_EQ(nbytes % sizeof(int64_t), 0);
+
+  runtime::metal::MetalThreadEntry* rt = runtime::metal::MetalThreadEntry::ThreadLocal();
+  id<MTLBuffer> src = (__bridge id<MTLBuffer>)(t->data);
+  id<MTLBuffer> tmp = rt->GetTempBuffer(t->device, nbytes);
+
+  runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+      entry_ptr->metal_api->GetCurrentStream(t->device), t->device.device_id);
+  id<MTLCommandBuffer> cb = stream->GetCommandBuffer("tvm.contrib.mps.lstm.copy_lengths");
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  [blit copyFromBuffer:src sourceOffset:0 toBuffer:tmp destinationOffset:0 size:nbytes];
+  [blit endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+
+  std::vector<int64_t> out(nbytes / sizeof(int64_t));
+  memcpy(out.data(), [tmp contents], nbytes);
+  return out;
+}
+
+int64_t GetLength0CPU(MetalThreadEntry* entry_ptr, DLTensor* lengths, int64_t seq_len) {
+  ICHECK(ffi::IsContiguous(*lengths));
+  ICHECK_EQ(lengths->ndim, 1);
+  ICHECK(TypeMatch(lengths->dtype, kDLInt, 64));
+  ICHECK(lengths->shape != nullptr);
+  ICHECK_EQ(lengths->shape[0], 1) << "length-aware MPS LSTM currently supports batch=1 only";
+  ICHECK(lengths->data != nullptr);
+
+  int64_t len = 0;
+  if (lengths->device.device_type == kDLCPU) {
+    len = static_cast<int64_t*>(lengths->data)[0];
+  } else if (lengths->device.device_type == kDLMetal) {
+    std::vector<int64_t> tmp = CopyTensorToCPUInt64(entry_ptr, lengths);
+    len = tmp.empty() ? 0 : tmp[0];
+  } else {
+    LOG(FATAL) << "Unsupported device for lengths: " << lengths->device.device_type;
+  }
+
+  if (len < 1) {
+    len = 1;
+  }
+  if (len > seq_len) {
+    len = seq_len;
+  }
+  return len;
+}
+
 std::vector<float> SlicePackedGates(const std::vector<float>& packed, int gate, int hidden_size, int in_size) {
   std::vector<float> out(static_cast<size_t>(hidden_size) * static_cast<size_t>(in_size));
   const size_t gate_row0 = static_cast<size_t>(gate) * static_cast<size_t>(hidden_size);
@@ -467,6 +521,140 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       id<MTLBuffer> h_dst = (__bridge id<MTLBuffer>)(h_n->data);
       id<MTLBuffer> c_dst = (__bridge id<MTLBuffer>)(c_n->data);
 
+      const NSUInteger state_bytes = static_cast<NSUInteger>(out_state_elems * sizeof(float));
+      id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+      [blit copyFromBuffer:h_mat.data sourceOffset:0 toBuffer:h_dst destinationOffset:0 size:state_bytes];
+      [blit copyFromBuffer:c_mat.data sourceOffset:0 toBuffer:c_dst destinationOffset:0 size:state_bytes];
+      [blit endEncoding];
+    }
+
+    [cb commit];
+  });
+
+  // Length-aware variant. This is a stepping stone towards true PackedSequence semantics.
+  // Currently implemented for batch=1 by running only the first `lengths[0]` timesteps and
+  // zero-filling the remaining padded output. This preserves the key "do not update state on padding"
+  // behavior for the batch=1 inference use case.
+  refl::GlobalDef().def_packed("tvm.contrib.mps.lstm_packed", [](ffi::PackedArgs args, ffi::Any* ret) {
+    auto x = args[0].cast<DLTensor*>();
+    auto lengths = args[1].cast<DLTensor*>();
+    auto weight_ih = args[2].cast<DLTensor*>();
+    auto weight_hh = args[3].cast<DLTensor*>();
+    auto bias_ih = args[4].cast<DLTensor*>();
+    auto bias_hh = args[5].cast<DLTensor*>();
+    auto h0 = args[6].cast<DLTensor*>();
+    auto c0 = args[7].cast<DLTensor*>();
+    auto out = args[8].cast<DLTensor*>();
+    auto h_n = args[9].cast<DLTensor*>();
+    auto c_n = args[10].cast<DLTensor*>();
+    int hidden_size = args[11].cast<int>();
+    int num_layers = args[12].cast<int>();
+    bool batch_first = args[13].cast<bool>();
+    bool bidirectional = args[14].cast<bool>();
+    bool reverse = args[15].cast<bool>();
+
+    ICHECK_EQ(num_layers, 1) << "tvm.contrib.mps.lstm_packed currently supports num_layers=1";
+    ICHECK(!bidirectional) << "tvm.contrib.mps.lstm_packed currently supports bidirectional=false";
+
+    ICHECK(TypeMatch(x->dtype, kDLFloat, 32));
+    ICHECK(TypeMatch(out->dtype, kDLFloat, 32));
+    ICHECK(ffi::IsContiguous(*x));
+    ICHECK(ffi::IsContiguous(*out));
+    ICHECK_EQ(x->device.device_type, kDLMetal);
+    ICHECK_EQ(out->device.device_type, kDLMetal);
+    ICHECK_EQ(x->device.device_id, out->device.device_id);
+
+    int batch = static_cast<int>(batch_first ? x->shape[0] : x->shape[1]);
+    int seq_len = static_cast<int>(batch_first ? x->shape[1] : x->shape[0]);
+    int input_size = static_cast<int>(x->shape[2]);
+
+    ICHECK_EQ(batch, 1) << "tvm.contrib.mps.lstm_packed currently supports batch=1 only";
+    ICHECK_EQ(out->ndim, 3);
+    ICHECK_EQ(out->shape[0], batch_first ? batch : seq_len);
+    ICHECK_EQ(out->shape[1], batch_first ? seq_len : batch);
+    ICHECK_EQ(out->shape[2], hidden_size);
+
+    // Initial states are not supported yet. The first milestone uses zero init.
+    (void)h0;
+    (void)c0;
+
+    MetalThreadEntry* entry_ptr = MetalThreadEntry::ThreadLocal();
+    id<MTLDevice> dev = entry_ptr->metal_api->GetDevice(x->device);
+    runtime::metal::Stream* stream = entry_ptr->metal_api->CastStreamOrGetDefault(
+        entry_ptr->metal_api->GetCurrentStream(x->device), x->device.device_id);
+    id<MTLCommandBuffer> cb = stream->GetCommandBuffer("tvm.contrib.mps.lstm_packed");
+
+    // Determine effective sequence length from `lengths[0]`.
+    const int64_t eff_len64 = GetLength0CPU(entry_ptr, lengths, static_cast<int64_t>(seq_len));
+    const int eff_len = static_cast<int>(eff_len64);
+
+    // Zero-fill outputs (out/h_n/c_n) so padded region is deterministic.
+    {
+      id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+      id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)(out->data);
+      id<MTLBuffer> hn_buf = (__bridge id<MTLBuffer>)(h_n->data);
+      id<MTLBuffer> cn_buf = (__bridge id<MTLBuffer>)(c_n->data);
+      [blit fillBuffer:out_buf range:NSMakeRange(0, ffi::GetDataSize(*out)) value:0];
+      [blit fillBuffer:hn_buf range:NSMakeRange(0, ffi::GetDataSize(*h_n)) value:0];
+      [blit fillBuffer:cn_buf range:NSMakeRange(0, ffi::GetDataSize(*c_n)) value:0];
+      [blit endEncoding];
+    }
+
+    LSTMCacheValue cached =
+        GetOrCreateLSTMLayer(entry_ptr, dev, input_size, hidden_size, weight_ih, weight_hh, bias_ih, bias_hh);
+    MPSRNNMatrixInferenceLayer* layer = cached.layer;
+
+    id<MTLBuffer> x_buf = (__bridge id<MTLBuffer>)(x->data);
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)(out->data);
+
+    NSMutableArray<MPSMatrix*>* src_mats = [NSMutableArray arrayWithCapacity:eff_len];
+    NSMutableArray<MPSMatrix*>* dst_mats = [NSMutableArray arrayWithCapacity:eff_len];
+
+    for (int k = 0; k < eff_len; ++k) {
+      const int t = reverse ? (eff_len - 1 - k) : k;
+      const NSUInteger x_off = batch_first ? static_cast<NSUInteger>(t) * static_cast<NSUInteger>(input_size * sizeof(float))
+                                           : static_cast<NSUInteger>(t) *
+                                                 static_cast<NSUInteger>(static_cast<size_t>(batch) *
+                                                                         static_cast<size_t>(input_size) * sizeof(float));
+      const NSUInteger y_off = batch_first ? static_cast<NSUInteger>(t) * static_cast<NSUInteger>(hidden_size * sizeof(float))
+                                           : static_cast<NSUInteger>(t) *
+                                                 static_cast<NSUInteger>(static_cast<size_t>(batch) *
+                                                                         static_cast<size_t>(hidden_size) * sizeof(float));
+
+      MPSMatrixDescriptor* x_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(batch)
+                                                                         columns:static_cast<NSUInteger>(input_size)
+                                                                        rowBytes:(batch_first ? static_cast<NSUInteger>(seq_len * input_size * sizeof(float))
+                                                                                              : static_cast<NSUInteger>(input_size * sizeof(float)))
+                                                                        dataType:MPSDataTypeFloat32];
+      MPSMatrixDescriptor* y_desc = [MPSMatrixDescriptor matrixDescriptorWithRows:static_cast<NSUInteger>(batch)
+                                                                         columns:static_cast<NSUInteger>(hidden_size)
+                                                                        rowBytes:(batch_first ? static_cast<NSUInteger>(seq_len * hidden_size * sizeof(float))
+                                                                                              : static_cast<NSUInteger>(hidden_size * sizeof(float)))
+                                                                        dataType:MPSDataTypeFloat32];
+
+      MPSMatrix* x_mat = [[MPSMatrix alloc] initWithBuffer:x_buf offset:x_off descriptor:x_desc];
+      MPSMatrix* y_mat = [[MPSMatrix alloc] initWithBuffer:out_buf offset:y_off descriptor:y_desc];
+      [src_mats addObject:x_mat];
+      [dst_mats addObject:y_mat];
+    }
+
+    NSMutableArray<MPSRNNRecurrentMatrixState*>* states = [NSMutableArray array];
+    [layer encodeSequenceToCommandBuffer:cb
+                          sourceMatrices:src_mats
+                     destinationMatrices:dst_mats
+                     recurrentInputState:nil
+                   recurrentOutputStates:states];
+
+    // Copy final states.
+    if (states.count > 0) {
+      MPSRNNRecurrentMatrixState* last = [states objectAtIndex:0];
+      MPSMatrix* h_mat = [last getRecurrentOutputMatrixForLayerIndex:0];
+      MPSMatrix* c_mat = [last getMemoryCellMatrixForLayerIndex:0];
+
+      id<MTLBuffer> h_dst = (__bridge id<MTLBuffer>)(h_n->data);
+      id<MTLBuffer> c_dst = (__bridge id<MTLBuffer>)(c_n->data);
+
+      const size_t out_state_elems = static_cast<size_t>(batch) * static_cast<size_t>(hidden_size);
       const NSUInteger state_bytes = static_cast<NSUInteger>(out_state_elems * sizeof(float));
       id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
       [blit copyFromBuffer:h_mat.data sourceOffset:0 toBuffer:h_dst destinationOffset:0 size:state_bytes];
